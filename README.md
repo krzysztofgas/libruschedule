@@ -13,7 +13,7 @@ Program działa na macOS, Windows i Linuksie. Hasła trafiają do pęku kluczy s
 ## Instalacja i uruchomienie
 
 ```bash
-git clone https://github.com/<uzytkownik>/libruschedule.git
+git clone https://github.com/krzysztofgas/libruschedule.git
 cd libruschedule
 pnpm install
 pnpm start
