@@ -7,7 +7,7 @@ import {
   randomUUID,
   scrypt,
 } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, hostname, userInfo } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
@@ -54,6 +54,21 @@ const weekdays = [
   ["Sunday", "Niedziela"],
 ];
 
+const cachePath = () => {
+  if (process.platform === "win32")
+    return join(
+      process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"),
+      "libruschedule",
+      "cache",
+    );
+  if (process.platform === "darwin")
+    return join(homedir(), "Library", "Caches", "libruschedule");
+  return join(
+    process.env.XDG_CACHE_HOME || join(homedir(), ".cache"),
+    "libruschedule",
+  );
+};
+
 const storePath = () => {
   if (process.platform === "win32")
     return join(
@@ -99,6 +114,25 @@ const clean = (value) =>
   String(value ?? "")
     .replace(/\s+/g, " ")
     .trim();
+
+const plural = (count, one, few, many) => {
+  if (count === 1) return one;
+  const last = count % 10;
+  const tens = count % 100;
+  return last >= 2 && last <= 4 && (tens < 12 || tens > 14) ? few : many;
+};
+
+const since = (milliseconds) => {
+  const minutes = Math.round(milliseconds / 60000);
+  if (minutes < 1) return "przed chwilą";
+  if (minutes < 60)
+    return `${minutes} ${plural(minutes, "minutę", "minuty", "minut")} temu`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24)
+    return `${hours} ${plural(hours, "godzinę", "godziny", "godzin")} temu`;
+  const days = Math.round(hours / 24);
+  return `${days} ${plural(days, "dzień", "dni", "dni")} temu`;
+};
 
 const paint = (text, code) =>
   ui.color && code ? `\u001B[${code}m${text}\u001B[0m` : String(text);
@@ -317,10 +351,13 @@ const choose = async (title, items) => {
 const pause = async (
   label = "Naciśnij dowolny klawisz, aby wrócić do menu",
 ) => {
-  if (!ui.interactive) return;
+  if (!ui.interactive) return null;
   write(process.stdout, paint(`\n${label}`, "90"));
-  await keys((chunk, key, stop) => stop(null, null));
+  const pressed = await keys((chunk, key, stop) =>
+    stop(null, key.name ?? String(chunk ?? "")),
+  );
   write(process.stdout, "\n");
+  return pressed;
 };
 
 const derive = promisify(scrypt);
@@ -555,6 +592,58 @@ const saveConfig = async (config) => {
   }
 };
 
+const cacheFile = () => join(cachePath(), "weeks.json");
+
+const readCache = async () => {
+  try {
+    const parsed = JSON.parse(await readFile(cacheFile(), "utf8"));
+    return parsed?.entries && typeof parsed.entries === "object"
+      ? parsed
+      : { entries: {} };
+  } catch {
+    return { entries: {} };
+  }
+};
+
+const writeCache = async (cache) => {
+  try {
+    const entries = Object.entries(cache.entries)
+      .filter(
+        ([, entry]) =>
+          Number.isFinite(entry?.fetchedAt) &&
+          Date.now() - entry.fetchedAt < 90 * 86400000,
+      )
+      .sort(([, a], [, b]) => b.fetchedAt - a.fetchedAt)
+      .slice(0, 20);
+    await mkdir(cachePath(), { recursive: true, mode: 0o700 });
+    await writeFile(
+      cacheFile(),
+      JSON.stringify({ entries: Object.fromEntries(entries) }),
+      { mode: 0o600 },
+    );
+  } catch {}
+};
+
+const dropCache = async () => {
+  try {
+    await rm(cacheFile(), { force: true });
+  } catch (error) {
+    throw new Failure("Nie udało się usunąć pamięci podręcznej.", {
+      cause: error,
+    });
+  }
+};
+
+const cacheLife = (week, now = new Date()) => {
+  const today = toIso(now);
+  if (week.to < today) return 7 * 86400000;
+  if (week.from > today) return 6 * 3600000;
+  const weekday = now.getDay() >= 1 && now.getDay() <= 5;
+  return weekday && now.getHours() >= 6 && now.getHours() < 17
+    ? 15 * 60000
+    : 3 * 3600000;
+};
+
 const connect = async (login, password) => {
   const client = new Librus();
   try {
@@ -598,6 +687,23 @@ const fetchProfile = async (client) => {
         ? lucky.value
         : null,
   };
+};
+
+const fetchSignature = async (client) => {
+  try {
+    const counters = await timeout(
+      client.info.getNotifications(),
+      20,
+      "Licznik powiadomień nie dotarł na czas.",
+    );
+    if (!counters || typeof counters !== "object") return null;
+    const watched = ["calendar", "homework", "absence"].map(
+      (name) => `${name}=${Number(counters[name]) || 0}`,
+    );
+    return watched.join(",");
+  } catch {
+    return null;
+  }
 };
 
 const fetchTimetable = async (client, week) => {
@@ -822,7 +928,85 @@ const grid = (header, rows, widths) => {
   ].join("\n");
 };
 
-const render = (schedule, profile) => {
+const cellsOf = (schedule) => {
+  const map = new Map();
+  for (const day of schedule.days) {
+    schedule.slots.forEach((slot, index) => {
+      map.set(`${day.day}#${slot.number}`, {
+        day,
+        slot,
+        lesson: day.lessons[index],
+      });
+    });
+  }
+  return map;
+};
+
+const describe = (lesson) =>
+  lesson
+    ? [lesson.subject, lesson.teacher, lesson.room].filter(Boolean).join(", ")
+    : null;
+
+const changesBetween = (before, after) => {
+  if (!before) return [];
+  const previous = cellsOf(before);
+  const changes = [];
+  for (const [key, { day, slot, lesson }] of cellsOf(after)) {
+    const old = previous.get(key);
+    const was = describe(old?.lesson);
+    const is = describe(lesson);
+    const notesBefore = (old?.lesson?.notes ?? []).join(" ");
+    const notesAfter = (lesson?.notes ?? []).join(" ");
+    if (was === is && notesBefore === notesAfter) continue;
+    const where = `${day.name} ${dates.short.format(day.date)}, lekcja ${slot.number}`;
+    if (!was && is) changes.push(`${where}: dodano ${is}`);
+    else if (was && !is) changes.push(`${where}: odwołano ${was}`);
+    else if (was !== is) changes.push(`${where}: ${was} -> ${is}`);
+    else
+      changes.push(`${where}: ${notesAfter || "usunięto wpis z terminarza"}`);
+  }
+  for (const day of after.days) {
+    const old = before.days.find((entry) => entry.day === day.day);
+    for (const note of day.notes) {
+      if (!old?.notes?.includes(note))
+        changes.push(`${day.name} ${dates.short.format(day.date)}: ${note}`);
+    }
+  }
+  return changes;
+};
+
+const trailer = (meta) => {
+  if (!meta) return [];
+  const lines = [];
+  const age = since(Date.now() - meta.fetchedAt);
+  if (meta.source === "cache") {
+    lines.push(paint(`Z pamięci podręcznej, pobrane ${age}.`, "90"));
+  } else if (meta.source === "offline") {
+    lines.push(
+      paint(
+        `Brak łączności z Synergią (${meta.reason}), pokazuję dane pobrane ${age}.`,
+        "33",
+      ),
+    );
+  } else {
+    const events = meta.reusedEvents
+      ? `${glyphs.dot}terminarz z pamięci, sprawdzony ${since(Date.now() - meta.eventsAt)}`
+      : "";
+    lines.push(paint(`Pobrane z dziennika przed chwilą${events}.`, "90"));
+  }
+  if (meta.changes?.length > 0) {
+    lines.push("", paint("Zmiany od poprzedniego pobrania:", "1"));
+    for (const change of meta.changes.slice(0, 10))
+      lines.push(`  ${glyphs.bullet} ${paint(change, "33")}`);
+    if (meta.changes.length > 10)
+      lines.push(paint(`  ...oraz ${meta.changes.length - 10} więcej`, "90"));
+  } else if (meta.source === "network" && meta.compared) {
+    lines.push(paint("Bez zmian od poprzedniego pobrania.", "90"));
+  }
+  return lines;
+};
+
+const render = (schedule, profile, meta) => {
   const head = [
     paint(`Plan lekcji${glyphs.dot}${schedule.week}`, "1"),
     [
@@ -898,9 +1082,10 @@ const render = (schedule, profile) => {
     ...(notes.length > 0 ? ["", paint("Terminarz:", "1"), ...notes] : []),
     "",
     paint(
-      `Lekcji w tygodniu: ${schedule.count}${glyphs.dot}pobrano ${dates.stamp.format(new Date())}`,
+      `Lekcji w tygodniu: ${schedule.count}${glyphs.dot}stan na ${dates.stamp.format(new Date(meta?.fetchedAt ?? Date.now()))}`,
       "90",
     ),
+    ...trailer(meta),
   ].join("\n");
 };
 
@@ -910,6 +1095,9 @@ const parseArguments = (argv) => {
     offset: 0,
     account: null,
     events: null,
+    cache: true,
+    refresh: false,
+    purge: false,
     help: false,
   };
   const args = [...argv];
@@ -927,6 +1115,9 @@ const parseArguments = (argv) => {
     else if (arg === "-a" || arg === "--account") options.account = value(arg);
     else if (arg === "--events") options.events = true;
     else if (arg === "--no-events") options.events = false;
+    else if (arg === "-r" || arg === "--refresh") options.refresh = true;
+    else if (arg === "--no-cache") options.cache = false;
+    else if (arg === "--clear-cache") options.purge = true;
     else if (arg === "--no-color") ui.color = false;
     else
       throw new Failure(
@@ -959,14 +1150,22 @@ Opcje:
   -a, --account <nazwa>    wybierz zapisane konto (nazwa lub login)
       --events             dociągnij szczegóły z terminarza
       --no-events          pomiń terminarz
+  -r, --refresh            pomiń pamięć podręczną i pobierz dane na nowo
+      --no-cache           nie czytaj i nie zapisuj pamięci podręcznej
+      --clear-cache        wyczyść pamięć podręczną i zakończ
       --no-color           wyłącz kolory
   -h, --help               ta pomoc
 
 Zmienne środowiskowe:
   LIBRUS_LOGIN, LIBRUS_PASSWORD - logowanie bez zapisanego konta
 
+Plan jest zapisywany w pamięci podręcznej i odświeżany, gdy zmienią się
+liczniki powiadomień w dzienniku albo minie czas ważności wpisu
+(15 minut w godzinach lekcyjnych, 3 godziny poza nimi, 7 dni dla minionych tygodni).
+
 Hasła trafiają do pęku kluczy systemu (Keychain, DPAPI, libsecret),
-a gdy nie jest dostępny - do zaszyfrowanego pliku ${join(storePath(), "config.json")}`;
+a gdy nie jest dostępny - do zaszyfrowanego pliku ${join(storePath(), "config.json")}
+Pamięć podręczna: ${cacheFile()}`;
 
 const pickAccount = (config, hint) => {
   if (config.accounts.length === 0) return null;
@@ -1027,25 +1226,122 @@ const openSession = async (config, account) => {
   return session;
 };
 
-const showPlan = async (client, profile, config, options, week) => {
-  const timetable = await step(
-    `Pobieranie planu ${week.from} - ${week.to}`,
-    () => fetchTimetable(client, week),
-  );
-  const events =
-    (options.events ?? config.events)
-      ? await step("Pobieranie terminarza", () => fetchEvents(client, week))
-      : [];
-  write(
-    process.stdout,
-    `\n${render(buildSchedule(timetable, week, events), profile)}\n`,
-  );
+const loadWeek = async (key, open, week, config, options) => {
+  const useCache = options.cache !== false;
+  const cache = useCache ? await readCache() : { entries: {} };
+  const stored = cache.entries[key];
+  const now = Date.now();
+
+  if (
+    !options.refresh &&
+    stored?.timetable &&
+    now - stored.fetchedAt < cacheLife(week)
+  ) {
+    return {
+      ...stored,
+      meta: {
+        source: "cache",
+        fetchedAt: stored.fetchedAt,
+        eventsAt: stored.eventsAt,
+      },
+    };
+  }
+
+  try {
+    const { client, profile } = await open();
+    const signature = await step("Sprawdzanie zmian w dzienniku", () =>
+      fetchSignature(client),
+    );
+    const timetable = await step(
+      `Pobieranie planu ${week.from} - ${week.to}`,
+      () => fetchTimetable(client, week),
+    );
+    const wanted = options.events ?? config.events;
+    const reuse =
+      !options.refresh &&
+      wanted &&
+      Array.isArray(stored?.events) &&
+      Boolean(signature) &&
+      signature === stored.signature &&
+      now - stored.eventsAt < 86400000;
+    const events = !wanted
+      ? []
+      : reuse
+        ? stored.events
+        : await step("Pobieranie terminarza", () => fetchEvents(client, week));
+
+    const entry = {
+      timetable,
+      events,
+      signature,
+      profile: { ...profile, luckyDay: toIso(new Date()) },
+      fetchedAt: now,
+      eventsAt: reuse ? stored.eventsAt : now,
+    };
+    if (useCache) {
+      cache.entries[key] = entry;
+      await writeCache(cache);
+    }
+    return {
+      ...entry,
+      meta: {
+        source: "network",
+        fetchedAt: now,
+        eventsAt: entry.eventsAt,
+        reusedEvents: Boolean(reuse),
+        previous: stored,
+      },
+    };
+  } catch (error) {
+    if (error instanceof Cancelled || !stored?.timetable) throw error;
+    return {
+      ...stored,
+      meta: {
+        source: "offline",
+        fetchedAt: stored.fetchedAt,
+        eventsAt: stored.eventsAt,
+        reason: error.message,
+      },
+    };
+  }
+};
+
+const rebuild = (entry, week) => {
+  try {
+    return entry?.timetable
+      ? buildSchedule(entry.timetable, week, entry.events ?? [])
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+const showPlan = async (key, open, week, config, options) => {
+  const data = await loadWeek(key, open, week, config, options);
+  const schedule = buildSchedule(data.timetable, week, data.events ?? []);
+  const before = rebuild(data.meta.previous, week);
+  const meta = {
+    ...data.meta,
+    compared: Boolean(before),
+    changes: changesBetween(before, schedule),
+  };
+  const profile = data.profile ?? { name: "Uczeń" };
+  const shown = {
+    ...profile,
+    lucky: profile.luckyDay === toIso(new Date()) ? profile.lucky : null,
+  };
+  write(process.stdout, `\n${render(schedule, shown, meta)}\n`);
 };
 
 const showWeek = async (config, account, options) => {
   const week = weekOf(options.date, options.offset);
-  const { client, profile } = await openSession(config, account);
-  await showPlan(client, profile, config, options, week);
+  await showPlan(
+    `${account.id}:${week.from}`,
+    () => openSession(config, account),
+    week,
+    config,
+    options,
+  );
 };
 
 const addAccount = async (config) => {
@@ -1192,6 +1488,7 @@ const menu = async (config, options) => {
           : "Włącz pobieranie terminarza",
         value: "events",
       },
+      { label: "Wyczyść pamięć podręczną", value: "purge" },
       { label: "Wyjście", value: "exit" },
     ]);
 
@@ -1202,14 +1499,22 @@ const menu = async (config, options) => {
         action === "date"
           ? await ask("Data (RRRR-MM-DD)", toIso(new Date()))
           : null;
-      await guard(() =>
-        showWeek(config, account, {
-          ...options,
-          date,
-          offset: action === "next" ? 1 : 0,
-        }),
-      );
-      await pause();
+      let refresh = options.refresh;
+      for (;;) {
+        await guard(() =>
+          showWeek(config, account, {
+            ...options,
+            date,
+            refresh,
+            offset: action === "next" ? 1 : 0,
+          }),
+        );
+        const pressed = await pause(
+          "Naciśnij r, aby pobrać na nowo, dowolny inny klawisz wraca do menu",
+        );
+        if (pressed !== "r") break;
+        refresh = true;
+      }
       continue;
     }
 
@@ -1229,6 +1534,14 @@ const menu = async (config, options) => {
     } else if (action === "events") {
       config.events = !config.events;
       await guard(() => saveConfig(config));
+    } else if (action === "purge") {
+      await guard(async () => {
+        await dropCache();
+        write(
+          process.stdout,
+          paint(`\n${glyphs.ok} Pamięć podręczna wyczyszczona.\n`, "32"),
+        );
+      });
     }
   }
 };
@@ -1238,13 +1551,16 @@ const once = async (config, options) => {
   const password = process.env.LIBRUS_PASSWORD;
   if (login && password) {
     const week = weekOf(options.date, options.offset);
-    const client = await step(`Logowanie jako ${login}`, () =>
-      connect(login, password),
-    );
-    const profile = await step("Pobieranie danych ucznia", () =>
-      fetchProfile(client),
-    );
-    await showPlan(client, profile, config, options, week);
+    const open = async () => {
+      const client = await step(`Logowanie jako ${login}`, () =>
+        connect(login, password),
+      );
+      const profile = await step("Pobieranie danych ucznia", () =>
+        fetchProfile(client),
+      );
+      return { client, profile };
+    };
+    await showPlan(`env:${login}:${week.from}`, open, week, config, options);
     return;
   }
   const account = pickAccount(config, options.account);
@@ -1260,6 +1576,11 @@ const main = async () => {
   const options = parseArguments(process.argv.slice(2));
   if (options.help) {
     write(process.stdout, `${help()}\n`);
+    return;
+  }
+  if (options.purge) {
+    await dropCache();
+    write(process.stdout, `Pamięć podręczna wyczyszczona.\n`);
     return;
   }
   const config = await loadConfig();
